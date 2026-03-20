@@ -769,6 +769,40 @@ class Http2ClientSpec extends AkkaSpecWithMaterializer("""
       }
     }
 
+    "handle incoming GOAWAY from server" should {
+
+      "close the connection when receiving GOAWAY with no active streams" inAssertAllStagesStopped new TestSetup {
+        user.emitRequest(Get("/"))
+        val streamId = network.expect[HeadersFrame]().streamId
+        network.sendHEADERS(streamId, endStream = true, Seq(RawHeader(":status", "200")))
+        user.expectResponse()
+
+        // Server signals it will not accept more streams
+        network.sendFrame(GoAwayFrame(streamId, ErrorCode.NO_ERROR))
+
+        // Client should close the connection gracefully
+        expectGracefulCompletion()
+      }
+
+      "wait for in-progress stream to complete before closing when receiving GOAWAY with active streams" inAssertAllStagesStopped new TestSetup {
+        user.emitRequest(Get("/"))
+        val streamId = network.expect[HeadersFrame]().streamId
+
+        // Server sends GOAWAY *before* the response — stream is still active
+        network.sendFrame(GoAwayFrame(streamId, ErrorCode.NO_ERROR))
+
+        // Connection must NOT be closed yet: the stream is still in flight
+        network.toNet.expectNoBytes(100.millis)
+
+        // Now the server delivers the response for the in-flight stream
+        network.sendHEADERS(streamId, endStream = true, Seq(RawHeader(":status", "200")))
+        user.expectResponse()
+
+        // Only now should the client close the connection gracefully
+        expectGracefulCompletion()
+      }
+    }
+
     "delay stage completion" should {
 
       "until in-flight responses are received" inAssertAllStagesStopped new TestSetup with NetProbes {
@@ -927,6 +961,7 @@ class Http2ClientSpec extends AkkaSpecWithMaterializer("""
         // force connection to shutdown (in case it is an invalid state)
         setup.network.fromNet.sendError(new RuntimeException)
         setup.network.toNet.cancel()
+        setup.user.requestOut.sendComplete()
 
         // and then assert that all stages, substreams in particular, are stopped
       }

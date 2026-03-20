@@ -6,16 +6,18 @@ package akka.http.impl.engine.http2
 
 import akka.actor.ActorSystem
 import akka.event.Logging
+import akka.http.impl.engine.http2.FrameEvent._
+import akka.http.impl.engine.http2.Http2Protocol.ErrorCode
 import akka.http.impl.engine.ws.ByteStringSinkProbe
 import akka.http.impl.util.{ AkkaSpecWithMaterializer, ExampleHttpContexts }
 import akka.http.scaladsl.model.{ AttributeKey, AttributeKeys, ContentTypes, HttpEntity, HttpHeader, HttpMethod, HttpMethods, HttpRequest, HttpResponse, RequestResponseAssociation, StatusCode, StatusCodes, Uri, headers }
-import akka.http.scaladsl.model.headers.HttpEncodings
+import akka.http.scaladsl.model.headers.{ HttpEncodings, RawHeader }
 import akka.http.scaladsl.settings.ClientConnectionSettings
 import akka.http.scaladsl.settings.Http2ClientSettings
 import akka.http.scaladsl.unmarshalling.Unmarshal
 import akka.http.scaladsl.{ ClientTransport, Http }
 import akka.http.scaladsl.settings.ServerSettings
-import akka.stream.{ KillSwitches, StreamTcpException, UniqueKillSwitch }
+import akka.stream.{ Attributes, KillSwitches, StreamTcpException, UniqueKillSwitch }
 import akka.stream.scaladsl.{ Flow, Keep, Sink, Source }
 import akka.stream.testkit.scaladsl.StreamTestKit
 import akka.stream.testkit.{ TestPublisher, TestSubscriber }
@@ -32,8 +34,6 @@ class Http2PersistentClientTlsSpec extends Http2PersistentClientSpec(true)
 class Http2PersistentClientPlaintextSpec extends Http2PersistentClientSpec(false)
 
 abstract class Http2PersistentClientSpec(tls: Boolean) extends AkkaSpecWithMaterializer(
-  // FIXME: would rather use remote-address-attribute, but that doesn't work with HTTP/2
-  // see https://github.com/akka/akka-http/issues/3707
   """akka.http.server.remote-address-attribute = on
      akka.http.server.enable-http2 = on
      akka.http.client.http2.log-frames = on
@@ -296,6 +296,89 @@ abstract class Http2PersistentClientSpec(tls: Boolean) extends AkkaSpecWithMater
     reconnectionTests(false)
     reconnectionTests(true)
 
+    "reconnect when server sends GOAWAY" inAssertAllStagesStopped {
+      // Custom-transport test only works for plaintext: for TLS the transport
+      // would receive TLS-encrypted bytes which we cannot interpret as raw frames.
+      assume(!tls, "GOAWAY reconnect test only runs for plaintext connections")
+
+      val connectionProbe = TestProbe()
+
+      new TestSetup(tls) {
+
+        // Store connections so shutdown() can close its transport for clean termination.
+        @volatile var connections = Seq.empty[RawHttp2Connection]
+
+        override def clientSettings: ClientConnectionSettings =
+          ClientConnectionSettings(system)
+            .mapHttp2Settings(_.withMaxPersistentAttempts(5).withBaseConnectionBackoff(Duration.Zero))
+            .withTransport(new ClientTransport {
+              override def connectTo(host: String, port: Int, settings: ClientConnectionSettings)(implicit system: ActorSystem): Flow[ByteString, ByteString, Future[Http.OutgoingConnection]] = {
+                Flow.fromMaterializer { (_, _) =>
+                  val connection = new RawHttp2Connection()
+                  connections :+= connection
+                  connectionProbe.ref ! connection
+                  connection.toClientFlow
+                }.mapMaterializedValue(_.flatten)
+              }
+            })
+
+        // No real server in this test, so we drive termination explicitly.
+        override def shutdown(): Unit = {
+          client.requestsOut.sendComplete()
+          connections.foreach { conn =>
+            conn.close()
+          }
+        }
+
+        client.sendRequest(
+          HttpRequest(method = HttpMethods.GET, uri = "/req1")
+            .addAttribute(requestIdAttr, RequestId("req1"))
+        )
+        client.responsesIn.request(1)
+
+        val conn1 = connectionProbe.expectMsgType[RawHttp2Connection]
+        conn1 should not be null
+        conn1.doHandshake()
+
+        val streamId1 = conn1.expect[HeadersFrame]().streamId
+
+        // Server sends GOAWAY *before* the response. This means:
+        //  - the client must not open any new streams on this connection
+        //  - completeIfDone() will fire once stream 1 finishes (not immediately, since it is still active)
+        // This ordering is important: it lets us use client.expectResponse() as a synchronization
+        // point — by the time the response is delivered to the test, completeIfDone() has already
+        // run, bufferedSubStreamOutput.complete() was called, and PersistentConnection.onDisconnected()
+        // has fired, putting PersistentConnection in Unconnected state.
+        conn1.sendFrame(GoAwayFrame(streamId1, ErrorCode.NO_ERROR))
+        conn1.sendHEADERS(streamId1, endStream = true, Seq(RawHeader(":status", "200")))
+        client.expectResponse()
+
+        // By this point, conn1 is closed and PersistentConnection is in Unconnected state,
+        // waiting for the next request to trigger a new connection.
+
+        // Next request must arrive on a NEW connection, not on the GOAWAY'd one.
+        client.sendRequest(
+          HttpRequest(method = HttpMethods.GET, uri = "/req2")
+            .addAttribute(requestIdAttr, RequestId("req2"))
+        )
+        client.responsesIn.request(1)
+
+        // leads to a new connection
+        val conn2 = connectionProbe.expectMsgType[RawHttp2Connection]
+
+        conn2.doHandshake()
+        val streamId2 = conn2.expect[HeadersFrame]().streamId
+        conn2.sendHEADERS(streamId2, endStream = true, Seq(RawHeader(":status", "200")))
+        val response2 = client.expectResponse()
+        response2.attribute(requestIdAttr).get.id shouldBe "req2"
+
+        client.requestsOut.sendComplete()
+        conn2.fromServer.expectCancellation()
+        conn2.close()
+        client.responsesIn.expectComplete()
+      }
+    }
+
     "not hammer the service with reconnects when backoff is enabled" in new TestSetup(tls) {
       val probe = TestProbe()
       override def clientSettings: ClientConnectionSettings =
@@ -351,6 +434,35 @@ abstract class Http2PersistentClientSpec(tls: Boolean) extends AkkaSpecWithMater
     }
   }
 
+  /** Minimal raw HTTP/2 server-side connection for custom-transport tests. */
+  private class RawHttp2Connection(implicit system: ActorSystem) extends Http2FrameHpackSupport {
+    val frameProbe: Http2FrameProbe = Http2FrameProbe()
+    val fromServer: TestPublisher.Probe[ByteString] = TestPublisher.probe[ByteString]()
+
+    override def frameProbeDelegate: Http2FrameProbe = frameProbe
+    override def sendBytes(bytes: ByteString): Unit = fromServer.sendNext(bytes)
+
+    def toClientFlow: Flow[ByteString, ByteString, Future[Http.OutgoingConnection]] =
+      Flow.fromSinkAndSource(frameProbe.sink, Source.fromPublisher(fromServer))
+        .mapMaterializedValue(_ => Future.successful(Http.OutgoingConnection(
+          InetSocketAddress.createUnresolved("localhost", 0),
+          InetSocketAddress.createUnresolved("localhost", 0)
+        )))
+
+    def doHandshake(): Unit = {
+      frameProbe.plainDataProbe.expectBytes(Http2Protocol.ClientConnectionPreface)
+      expectSETTINGS()
+      sendFrame(SettingsFrame(Nil))
+      // Note: client may send request HEADERS before SETTINGS ACK when a request
+      // is already queued at connection time, so we don't assert SETTINGS ACK here.
+    }
+
+    def close(): Unit = {
+      fromServer.sendComplete()
+      frameProbe.plainDataProbe.cancel()
+    }
+  }
+
   case class ServerRequest(request: HttpRequest, promise: Promise[HttpResponse]) {
     lazy val entityAsString = Unmarshal(request.entity).to[String].futureValue
 
@@ -385,6 +497,7 @@ abstract class Http2PersistentClientSpec(tls: Boolean) extends AkkaSpecWithMater
               killProbe.ref ! killer
             }
             .viaMat(ClientTransport.TCP.connectTo(server.binding.localAddress.getHostString, server.binding.localAddress.getPort, settings)(system))(Keep.right)
+            .addAttributes(Attributes.name("CustomTransport"))
         }
       })
 
