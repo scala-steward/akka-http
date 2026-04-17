@@ -91,20 +91,20 @@ class H2SpecIntegrationSpec extends AkkaSpec(
     /** Cases that are known to fail, but we haven't triaged yet */
     val pendingTestCases = Seq(
       "4.2",
-      "4.3",
       "5.1",
       "5.1.1",
       "5.1.2",
       "5.5",
       "6.1",
-      "6.3",
+      "6.5",
       "6.5.2",
       "6.9",
       "6.9.1",
-      "6.10",
+      "8.1",
       "8.1.2",
       "8.1.2.1",
       "8.1.2.2",
+      "8.1.2.3",
       "8.1.2.6"
     )
 
@@ -158,7 +158,7 @@ class H2SpecIntegrationSpec extends AkkaSpec(
         "-p", port.toString,
         "-j", junitOutput.getPath
       ) ++
-        specSectionNumber.toList.flatMap(number => Seq("-s", number))
+        specSectionNumber.toList.map(number => s"http2/$number")
 
       log.debug(s"Executing h2spec: $command")
       val aggregateTckLogs = ProcessLogger(
@@ -182,7 +182,10 @@ class H2SpecIntegrationSpec extends AkkaSpec(
       exitedWith should be(0)
     }
 
-    def executable =
-      System.getProperty("h2spec.path").ensuring(_ != null, "h2spec.path property not defined")
+    def executable: String = {
+      val path = System.getProperty("h2spec.path")
+      if (path != null && new File(path).canExecute) path
+      else throw new org.scalatest.exceptions.TestCanceledException("h2spec not available - install it locally, see CONTRIBUTING.md", 0)
+    }
   }
 }
